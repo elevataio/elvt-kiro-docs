@@ -1,0 +1,913 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Kiro Enterprise Deployment - Complete Setup
+  ============================================
+  This template provisions all AWS resources needed to run Kiro Enterprise:
+  - IAM Admin Role for Kiro management (profile, subscriptions, governance)
+  - S3 bucket for prompt logging (user prompts and Kiro responses)
+  - S3 bucket for user activity reports (daily CSV usage telemetry)
+  - KMS key for log encryption
+  - S3 bucket policies allowing Kiro service to write logs
+  - IAM policy for Kiro administrators
+  - CloudTrail logging for audit (optional)
+  
+  After deploying this stack, complete the Kiro setup in the AWS Console:
+  1. Navigate to the Kiro Console
+  2. Create a Kiro Profile (linking to your Identity Center instance)
+  3. Subscribe users/groups using the IAM role this template creates
+  4. Enable prompt logging pointing to the S3 bucket created here
+  5. Enable user activity reports pointing to the activity bucket
+
+  Version: 1.0.0
+  Author: Kiro AWS Deployment Guide
+
+# =============================================================================
+# METADATA - Controls CloudFormation Console parameter grouping and display
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Organization Information"
+        Parameters:
+          - OrganizationName
+          - Environment
+          - AwsRegion
+      - Label:
+          default: "IAM Identity Center Configuration"
+        Parameters:
+          - IdentityCenterInstanceArn
+          - IdentityCenterRegion
+          - KiroAdminGroupId
+          - KiroDeveloperGroupId
+      - Label:
+          default: "Kiro Subscription Settings"
+        Parameters:
+          - DefaultSubscriptionTier
+          - MaxSubscriptions
+      - Label:
+          default: "Logging and Monitoring"
+        Parameters:
+          - EnablePromptLogging
+          - EnableUserActivityReports
+          - LogRetentionDays
+          - EnableCloudTrail
+      - Label:
+          default: "Security"
+        Parameters:
+          - EnableKmsEncryption
+          - AllowedIpCidrs
+    ParameterLabels:
+      OrganizationName:
+        default: "Your Organization Name"
+      Environment:
+        default: "Deployment Environment"
+      AwsRegion:
+        default: "Kiro Deployment Region"
+      IdentityCenterInstanceArn:
+        default: "IAM Identity Center Instance ARN"
+      IdentityCenterRegion:
+        default: "IAM Identity Center Region"
+      KiroAdminGroupId:
+        default: "Admin Group ID (from Identity Center)"
+      KiroDeveloperGroupId:
+        default: "Developer Group ID (from Identity Center)"
+      DefaultSubscriptionTier:
+        default: "Default Subscription Tier"
+      MaxSubscriptions:
+        default: "Maximum Number of Subscriptions"
+      EnablePromptLogging:
+        default: "Enable Prompt Logging to S3?"
+      EnableUserActivityReports:
+        default: "Enable User Activity Reports?"
+      LogRetentionDays:
+        default: "Log Retention (days)"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Audit Logging?"
+      EnableKmsEncryption:
+        default: "Enable KMS Encryption for Logs?"
+      AllowedIpCidrs:
+        default: "Allowed IP Ranges (CIDR)"
+
+# =============================================================================
+# PARAMETERS - User inputs for deployment customization
+# =============================================================================
+Parameters:
+  # --- Organization Info ---
+  OrganizationName:
+    Type: String
+    Description: "Your company/organization name (used for resource naming). Example: acme-corp"
+    AllowedPattern: "^[a-z0-9-]{3,30}$"
+    ConstraintDescription: "Lowercase letters, numbers, and hyphens only. 3-30 characters."
+
+  Environment:
+    Type: String
+    Default: "production"
+    AllowedValues:
+      - production
+      - staging
+      - development
+    Description: "Target environment for this deployment"
+
+  AwsRegion:
+    Type: String
+    Default: "us-east-1"
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    Description: "AWS Region where Kiro will be configured. Must match a Kiro-supported region."
+
+  # --- Identity Center ---
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: |
+      The ARN of your IAM Identity Center instance.
+      Find it in: AWS Console > IAM Identity Center > Settings > Instance ARN
+      Example: arn:aws:sso:::instance/ssoins-1234567890abcdef
+    AllowedPattern: "^arn:aws:sso:::instance/ssoins-[a-z0-9]+$"
+    ConstraintDescription: "Must be a valid IAM Identity Center instance ARN"
+
+  IdentityCenterRegion:
+    Type: String
+    Default: "us-east-1"
+    Description: "Region where your IAM Identity Center is deployed"
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  KiroAdminGroupId:
+    Type: String
+    Description: |
+      The Group ID from Identity Center for Kiro administrators.
+      These users will manage Kiro profiles, subscriptions, and governance.
+      Find it in: IAM Identity Center > Groups > [Group Name] > Group ID
+      Example: a1b2c3d4-5678-90ab-cdef-111111111111
+    AllowedPattern: "^[a-f0-9-]{36}$"
+    ConstraintDescription: "Must be a valid UUID format (e.g., a1b2c3d4-5678-90ab-cdef-111111111111)"
+
+  KiroDeveloperGroupId:
+    Type: String
+    Description: |
+      The Group ID from Identity Center for Kiro developers (users).
+      These users will have Kiro subscriptions assigned to them.
+      Find it in: IAM Identity Center > Groups > [Group Name] > Group ID
+      Example: a1b2c3d4-5678-90ab-cdef-222222222222
+    AllowedPattern: "^[a-f0-9-]{36}$"
+    ConstraintDescription: "Must be a valid UUID format"
+
+  # --- Subscription Settings ---
+  DefaultSubscriptionTier:
+    Type: String
+    Default: "Pro"
+    AllowedValues:
+      - Free
+      - Pro
+      - ProPlus
+      - ProMax
+      - Power
+    Description: "Default subscription tier for new users. Pro=$20/mo, Pro+=$40/mo, ProMax=$100/mo, Power=$200/mo"
+
+  MaxSubscriptions:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+    Description: "Maximum number of Kiro subscriptions to allow (for budget control)"
+
+  # --- Logging ---
+  EnablePromptLogging:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Log user prompts and Kiro responses to S3 for compliance and audit"
+
+  EnableUserActivityReports:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable daily CSV usage reports (credit consumption, session data)"
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues:
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+      - 730
+    Description: "Days to retain logs before automatic deletion"
+
+  EnableCloudTrail:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable CloudTrail for auditing Kiro API calls (who did what, when)"
+
+  # --- Security ---
+  EnableKmsEncryption:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Use customer-managed KMS key for log encryption (recommended for compliance)"
+
+  AllowedIpCidrs:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: |
+      Comma-separated list of CIDR ranges allowed to access Kiro.
+      Use your corporate IP range for additional security.
+      Example: 10.0.0.0/8,172.16.0.0/12
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  ShouldEnablePromptLogging: !Equals [!Ref EnablePromptLogging, "true"]
+  ShouldEnableActivityReports: !Equals [!Ref EnableUserActivityReports, "true"]
+  ShouldEnableCloudTrail: !Equals [!Ref EnableCloudTrail, "true"]
+  ShouldEnableKms: !Equals [!Ref EnableKmsEncryption, "true"]
+  CreateAnyBucket: !Or
+    - !Condition ShouldEnablePromptLogging
+    - !Condition ShouldEnableActivityReports
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # KMS KEY - For encrypting Kiro logs at rest
+  # ---------------------------------------------------------------------------
+  KiroLogsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: ShouldEnableKms
+    Properties:
+      Description: !Sub "KMS key for encrypting Kiro logs - ${OrganizationName}-${Environment}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowRootAccountFullAccess"
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: "AllowKiroServiceToEncrypt"
+            Effect: Allow
+            Principal:
+              Service: "kiro.amazonaws.com"
+            Action:
+              - "kms:GenerateDataKey"
+              - "kms:Decrypt"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - Sid: "AllowS3ServiceToUseKey"
+            Effect: Allow
+            Principal:
+              Service: "s3.amazonaws.com"
+            Action:
+              - "kms:GenerateDataKey"
+              - "kms:Decrypt"
+            Resource: "*"
+          - Sid: "AllowCloudTrailToEncrypt"
+            Effect: Allow
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action:
+              - "kms:GenerateDataKey"
+              - "kms:Decrypt"
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: "cloudformation"
+
+  KiroLogsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: ShouldEnableKms
+    Properties:
+      AliasName: !Sub "alias/${OrganizationName}-kiro-logs-${Environment}"
+      TargetKeyId: !Ref KiroLogsKmsKey
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET - Prompt Logging (user prompts + Kiro responses)
+  # ---------------------------------------------------------------------------
+  KiroPromptLogBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldEnablePromptLogging
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${OrganizationName}-kiro-prompt-logs-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - ShouldEnableKms
+                - "aws:kms"
+                - "AES256"
+              KMSMasterKeyID: !If
+                - ShouldEnableKms
+                - !GetAtt KiroLogsKmsKey.Arn
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: "RetentionPolicy"
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+          - Id: "TransitionToIA"
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: "TransitionToGlacier"
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "prompt-logging"
+        - Key: DataClassification
+          Value: "confidential"
+
+  KiroPromptLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldEnablePromptLogging
+    Properties:
+      Bucket: !Ref KiroPromptLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowKiroServiceToWritePromptLogs"
+            Effect: Allow
+            Principal:
+              Service: "kiro.amazonaws.com"
+            Action:
+              - "s3:PutObject"
+              - "s3:PutObjectAcl"
+            Resource: !Sub "${KiroPromptLogBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              StringLike:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+          - Sid: "AllowKiroServiceToGetBucketLocation"
+            Effect: Allow
+            Principal:
+              Service: "kiro.amazonaws.com"
+            Action:
+              - "s3:GetBucketLocation"
+              - "s3:ListBucket"
+            Resource: !GetAtt KiroPromptLogBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - Sid: "DenyUnencryptedTransport"
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt KiroPromptLogBucket.Arn
+              - !Sub "${KiroPromptLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - Sid: "DenyDeleteOperations"
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - "s3:DeleteObject"
+              - "s3:DeleteBucket"
+            Resource:
+              - !GetAtt KiroPromptLogBucket.Arn
+              - !Sub "${KiroPromptLogBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "aws:PrincipalAccount": !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET - User Activity Reports (daily CSV telemetry)
+  # ---------------------------------------------------------------------------
+  KiroActivityReportBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldEnableActivityReports
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${OrganizationName}-kiro-activity-reports-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - ShouldEnableKms
+                - "aws:kms"
+                - "AES256"
+              KMSMasterKeyID: !If
+                - ShouldEnableKms
+                - !GetAtt KiroLogsKmsKey.Arn
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: "RetentionPolicy"
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+          - Id: "TransitionToIA"
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 60
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "user-activity-reports"
+        - Key: DataClassification
+          Value: "internal"
+
+  KiroActivityReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldEnableActivityReports
+    Properties:
+      Bucket: !Ref KiroActivityReportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowKiroServiceToWriteReports"
+            Effect: Allow
+            Principal:
+              Service: "kiro.amazonaws.com"
+            Action:
+              - "s3:PutObject"
+              - "s3:PutObjectAcl"
+            Resource: !Sub "${KiroActivityReportBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - Sid: "AllowKiroServiceBucketAccess"
+            Effect: Allow
+            Principal:
+              Service: "kiro.amazonaws.com"
+            Action:
+              - "s3:GetBucketLocation"
+              - "s3:ListBucket"
+            Resource: !GetAtt KiroActivityReportBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - Sid: "DenyUnencryptedTransport"
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt KiroActivityReportBucket.Arn
+              - !Sub "${KiroActivityReportBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLE - Kiro Administrator Role
+  # ---------------------------------------------------------------------------
+  KiroAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${OrganizationName}-kiro-admin-${Environment}"
+      Description: "Role for Kiro administrators to manage profiles, subscriptions, and governance"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:PrincipalTag/kiro-admin": "true"
+      MaxSessionDuration: 3600
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "kiro-administration"
+
+  # ---------------------------------------------------------------------------
+  # IAM POLICY - Kiro Profile and Subscription Management
+  # ---------------------------------------------------------------------------
+  KiroManagementPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${OrganizationName}-kiro-management-${Environment}"
+      Description: "Permissions to manage Kiro profiles, subscriptions, and governance settings"
+      Roles:
+        - !Ref KiroAdminRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Kiro Profile Management
+          - Sid: "KiroProfileManagement"
+            Effect: Allow
+            Action:
+              - "codewhisperer:CreateProfile"
+              - "codewhisperer:UpdateProfile"
+              - "codewhisperer:GetProfile"
+              - "codewhisperer:ListProfiles"
+              - "codewhisperer:DeleteProfile"
+            Resource: "*"
+          # Kiro Subscription Management
+          - Sid: "KiroSubscriptionManagement"
+            Effect: Allow
+            Action:
+              - "codewhisperer:CreateSubscription"
+              - "codewhisperer:UpdateSubscription"
+              - "codewhisperer:DeleteSubscription"
+              - "codewhisperer:ListSubscriptions"
+              - "codewhisperer:GetSubscription"
+              - "codewhisperer:ListGroupsForSubscription"
+            Resource: "*"
+          # Kiro Governance and Settings
+          - Sid: "KiroGovernance"
+            Effect: Allow
+            Action:
+              - "codewhisperer:UpdateGovernanceSettings"
+              - "codewhisperer:GetGovernanceSettings"
+              - "codewhisperer:PutGovernancePolicy"
+              - "codewhisperer:GetGovernancePolicy"
+              - "codewhisperer:ListGovernancePolicies"
+            Resource: "*"
+          # Identity Center - Read access for user/group lookup
+          - Sid: "IdentityCenterReadAccess"
+            Effect: Allow
+            Action:
+              - "sso:DescribeInstance"
+              - "sso:ListInstances"
+              - "sso-directory:ListGroupMembers"
+              - "sso-directory:DescribeGroup"
+              - "sso-directory:DescribeUser"
+              - "sso-directory:ListGroups"
+              - "sso-directory:ListUsers"
+              - "sso-directory:SearchGroups"
+              - "sso-directory:SearchUsers"
+            Resource: "*"
+          # Identity Center - Managed application for Kiro
+          - Sid: "IdentityCenterManagedApp"
+            Effect: Allow
+            Action:
+              - "sso:CreateManagedApplicationInstance"
+              - "sso:DeleteManagedApplicationInstance"
+              - "sso:GetManagedApplicationInstance"
+            Resource: "*"
+          # S3 - Access to logging buckets for configuration
+          - Sid: "S3LogBucketAccess"
+            Effect: Allow
+            Action:
+              - "s3:GetBucketLocation"
+              - "s3:GetBucketPolicy"
+              - "s3:ListBucket"
+              - "s3:GetObject"
+            Resource:
+              - !If
+                - ShouldEnablePromptLogging
+                - !GetAtt KiroPromptLogBucket.Arn
+                - !Sub "arn:aws:s3:::${OrganizationName}-kiro-prompt-logs-${Environment}-${AWS::AccountId}"
+              - !If
+                - ShouldEnablePromptLogging
+                - !Sub "${KiroPromptLogBucket.Arn}/*"
+                - !Sub "arn:aws:s3:::${OrganizationName}-kiro-prompt-logs-${Environment}-${AWS::AccountId}/*"
+              - !If
+                - ShouldEnableActivityReports
+                - !GetAtt KiroActivityReportBucket.Arn
+                - !Sub "arn:aws:s3:::${OrganizationName}-kiro-activity-reports-${Environment}-${AWS::AccountId}"
+              - !If
+                - ShouldEnableActivityReports
+                - !Sub "${KiroActivityReportBucket.Arn}/*"
+                - !Sub "arn:aws:s3:::${OrganizationName}-kiro-activity-reports-${Environment}-${AWS::AccountId}/*"
+          # KMS - Access to encryption key
+          - !If
+            - ShouldEnableKms
+            - Sid: "KmsKeyAccess"
+              Effect: Allow
+              Action:
+                - "kms:DescribeKey"
+                - "kms:GetKeyPolicy"
+                - "kms:ListAliases"
+              Resource:
+                - !GetAtt KiroLogsKmsKey.Arn
+            - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------------------
+  # IAM POLICY - Read-Only Policy for Developers (view their own usage)
+  # ---------------------------------------------------------------------------
+  KiroDeveloperReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${OrganizationName}-kiro-developer-readonly-${Environment}"
+      Description: "Read-only access for developers to view Kiro settings and their usage"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "KiroReadOnly"
+            Effect: Allow
+            Action:
+              - "codewhisperer:GetProfile"
+              - "codewhisperer:ListProfiles"
+              - "codewhisperer:GetSubscription"
+              - "codewhisperer:ListSubscriptions"
+            Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # CLOUDTRAIL - Audit logging for Kiro API calls
+  # ---------------------------------------------------------------------------
+  KiroAuditTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldEnableCloudTrail
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${OrganizationName}-kiro-cloudtrail-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - ShouldEnableKms
+                - "aws:kms"
+                - "AES256"
+              KMSMasterKeyID: !If
+                - ShouldEnableKms
+                - !GetAtt KiroLogsKmsKey.Arn
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: "RetentionPolicy"
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "audit-trail"
+
+  KiroAuditTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldEnableCloudTrail
+    Properties:
+      Bucket: !Ref KiroAuditTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowCloudTrailAclCheck"
+            Effect: Allow
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:GetBucketAcl"
+            Resource: !GetAtt KiroAuditTrailBucket.Arn
+          - Sid: "AllowCloudTrailWrite"
+            Effect: Allow
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:PutObject"
+            Resource: !Sub "${KiroAuditTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+          - Sid: "DenyUnencryptedTransport"
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt KiroAuditTrailBucket.Arn
+              - !Sub "${KiroAuditTrailBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  KiroCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: ShouldEnableCloudTrail
+    DependsOn: KiroAuditTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${OrganizationName}-kiro-audit-${Environment}"
+      IsLogging: true
+      S3BucketName: !Ref KiroAuditTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # SCP-STYLE POLICY (IAM Boundary) - Budget Control
+  # ---------------------------------------------------------------------------
+  KiroBudgetBoundaryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${OrganizationName}-kiro-budget-boundary-${Environment}"
+      Description: "Permission boundary to limit Kiro subscription creation (budget control)"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowKiroWithTierRestriction"
+            Effect: Allow
+            Action:
+              - "codewhisperer:CreateSubscription"
+              - "codewhisperer:UpdateSubscription"
+            Resource: "*"
+          - Sid: "DenyPowerTierUnlessExplicit"
+            Effect: Deny
+            Action:
+              - "codewhisperer:CreateSubscription"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "codewhisperer:SubscriptionTier": "Power"
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH - Budget Alarm for Kiro Spending
+  # ---------------------------------------------------------------------------
+  KiroBudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${OrganizationName}-kiro-budget-alert-${Environment}"
+      AlarmDescription: !Sub "Alert when Kiro spending exceeds expected threshold based on ${MaxSubscriptions} subscriptions"
+      Namespace: "AWS/Billing"
+      MetricName: "EstimatedCharges"
+      Dimensions:
+        - Name: ServiceName
+          Value: "Kiro"
+        - Name: Currency
+          Value: "USD"
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref MaxSubscriptions
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: "kiro-enterprise"
+
+# =============================================================================
+# OUTPUTS - Important values for post-deployment configuration
+# =============================================================================
+Outputs:
+  KiroAdminRoleArn:
+    Description: "ARN of the Kiro Admin IAM Role. Use this role to manage Kiro in the AWS Console."
+    Value: !GetAtt KiroAdminRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AdminRoleArn"
+
+  KiroAdminRoleName:
+    Description: "Name of the Kiro Admin IAM Role"
+    Value: !Ref KiroAdminRole
+
+  PromptLogBucketName:
+    Condition: ShouldEnablePromptLogging
+    Description: |
+      S3 bucket for prompt logging. Configure this in Kiro Console > Settings > Prompt Logging.
+      Kiro will write logs at: s3://bucket/AWSLogs/{accountId}/KiroLogs/prompt_log/{region}/yyyy/mm/dd/
+    Value: !Ref KiroPromptLogBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-PromptLogBucket"
+
+  PromptLogBucketArn:
+    Condition: ShouldEnablePromptLogging
+    Description: "ARN of the prompt log S3 bucket"
+    Value: !GetAtt KiroPromptLogBucket.Arn
+
+  ActivityReportBucketName:
+    Condition: ShouldEnableActivityReports
+    Description: |
+      S3 bucket for user activity reports. Configure this in Kiro Console > Settings > User Activity.
+      Daily CSV reports at: s3://bucket/AWSLogs/{accountId}/KiroLogs/user_report/{region}/yyyy/mm/dd/
+    Value: !Ref KiroActivityReportBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ActivityReportBucket"
+
+  ActivityReportBucketArn:
+    Condition: ShouldEnableActivityReports
+    Description: "ARN of the activity report S3 bucket"
+    Value: !GetAtt KiroActivityReportBucket.Arn
+
+  KmsKeyArn:
+    Condition: ShouldEnableKms
+    Description: "ARN of the KMS key used for log encryption"
+    Value: !GetAtt KiroLogsKmsKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KmsKeyArn"
+
+  KmsKeyAlias:
+    Condition: ShouldEnableKms
+    Description: "Alias of the KMS encryption key"
+    Value: !Sub "alias/${OrganizationName}-kiro-logs-${Environment}"
+
+  CloudTrailName:
+    Condition: ShouldEnableCloudTrail
+    Description: "Name of the CloudTrail trail for Kiro audit logging"
+    Value: !Ref KiroCloudTrail
+
+  CloudTrailBucket:
+    Condition: ShouldEnableCloudTrail
+    Description: "S3 bucket where CloudTrail stores Kiro audit logs"
+    Value: !Ref KiroAuditTrailBucket
+
+  IdentityCenterInstanceArn:
+    Description: "IAM Identity Center Instance ARN configured for Kiro"
+    Value: !Ref IdentityCenterInstanceArn
+
+  AdminGroupId:
+    Description: "Identity Center Group ID for Kiro administrators"
+    Value: !Ref KiroAdminGroupId
+
+  DeveloperGroupId:
+    Description: "Identity Center Group ID for Kiro developers"
+    Value: !Ref KiroDeveloperGroupId
+
+  NextSteps:
+    Description: "IMPORTANT - Complete these manual steps after stack creation"
+    Value: !Sub |
+      Stack deployed successfully! Complete these steps in the AWS Console:
+      1. Navigate to the Kiro Console (search 'Kiro' in AWS Console)
+      2. Click 'Onboard your team to Kiro'
+      3. Select IAM Identity Center as identity source
+      4. Create a Kiro Profile in region: ${AwsRegion}
+      5. Add group '${KiroDeveloperGroupId}' with tier '${DefaultSubscriptionTier}'
+      6. Enable Prompt Logging -> bucket: ${OrganizationName}-kiro-prompt-logs-${Environment}-${AWS::AccountId}
+      7. Enable User Activity -> bucket: ${OrganizationName}-kiro-activity-reports-${Environment}-${AWS::AccountId}
+      8. Share the Sign-in URL with your developers
+
+  DeploymentSummary:
+    Description: "Summary of deployed resources"
+    Value: !Sub |
+      Organization: ${OrganizationName}
+      Environment: ${Environment}
+      Region: ${AwsRegion}
+      Identity Center: ${IdentityCenterInstanceArn}
+      Admin Group: ${KiroAdminGroupId}
+      Developer Group: ${KiroDeveloperGroupId}
+      Subscription Tier: ${DefaultSubscriptionTier}
+      Prompt Logging: ${EnablePromptLogging}
+      Activity Reports: ${EnableUserActivityReports}
+      CloudTrail: ${EnableCloudTrail}
+      KMS Encryption: ${EnableKmsEncryption}
